@@ -7,7 +7,10 @@ from contextlib import AsyncExitStack
 from typing import Any, Dict, List
 
 import httpx
+import uvicorn
 from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -702,6 +705,76 @@ After receiving tool results, interpret them for the user in a helpful way.
                 logging.error(f"Error during cleanup of server {server.name}: {e}")
 
 
+class HTTPServer:
+    """HTTP server to handle web requests."""
+    
+    def __init__(self, slack_bot: SlackMCPBot, port: int = 80):
+        self.slack_bot = slack_bot
+        self.port = port
+        self.app = FastAPI(title="MCP Slack Bot API", version="1.0.0")
+        self.setup_routes()
+        
+    def setup_routes(self):
+        """Setup HTTP routes."""
+        
+        @self.app.get("/")
+        async def root():
+            """Root endpoint."""
+            return {"message": "MCP Slack Bot HTTP Server", "status": "running"}
+        
+        @self.app.get("/health")
+        async def health():
+            """Health check endpoint."""
+            return {"status": "healthy", "servers": len(self.slack_bot.servers)}
+        
+        @self.app.get("/tools")
+        async def list_tools():
+            """List available tools."""
+            tools_info = []
+            for tool in self.slack_bot.tools:
+                tools_info.append({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "schema": tool.input_schema
+                })
+            return {"tools": tools_info}
+        
+        @self.app.post("/execute/{tool_name}")
+        async def execute_tool(tool_name: str, arguments: dict):
+            """Execute a tool via HTTP."""
+            try:
+                # Find the appropriate server for this tool
+                for server in self.slack_bot.servers:
+                    server_tools = [tool.name for tool in await server.list_tools()]
+                    if tool_name in server_tools:
+                        result = await server.execute_tool(tool_name, arguments)
+                        return {"tool": tool_name, "result": result}
+                
+                raise HTTPException(status_code=404, detail=f"Tool '{tool_name}' not found")
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
+        
+        @self.app.get("/conversations/{channel_id}")
+        async def get_conversation(channel_id: str):
+            """Get conversation history for a channel."""
+            if channel_id in self.slack_bot.conversations:
+                return {"channel_id": channel_id, "messages": self.slack_bot.conversations[channel_id]["messages"]}
+            else:
+                raise HTTPException(status_code=404, detail="Channel not found")
+    
+    async def start(self):
+        """Start the HTTP server."""
+        config = uvicorn.Config(
+            app=self.app,
+            host="0.0.0.0",
+            port=self.port,
+            log_level="info"
+        )
+        server = uvicorn.Server(config)
+        logging.info(f"Starting HTTP server on port {self.port}")
+        await server.serve()
+
+
 async def main() -> None:
     """Initialize and run the Slack bot."""
     config = Configuration()
@@ -723,11 +796,25 @@ async def main() -> None:
         config.slack_bot_token, config.slack_app_token, servers, llm_client
     )
 
+    # Initialize the HTTP server
+    http_server = HTTPServer(slack_bot, port=80)
+
     try:
-        await slack_bot.start()
-        # Keep the main task alive until interrupted
-        while True:
-            await asyncio.sleep(1)
+        # Initialize the Slack bot first
+        await slack_bot.initialize_servers()
+        await slack_bot.initialize_bot_info()
+        
+        # Start the socket mode handler task
+        slack_task = asyncio.create_task(slack_bot.socket_mode_handler.start_async())
+        
+        # Start the HTTP server task
+        http_task = asyncio.create_task(http_server.start())
+        
+        logging.info("Starting both Slack bot and HTTP server...")
+        
+        # Run both tasks concurrently
+        await asyncio.gather(slack_task, http_task)
+        
     except KeyboardInterrupt:
         logging.info("Shutting down...")
     except Exception as e:
